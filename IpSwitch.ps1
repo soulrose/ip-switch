@@ -1,4 +1,4 @@
-﻿# IP Switch: moves this PC's hospital static IP between LAN and Wi-Fi, or puts both back on DHCP.
+﻿# IP Switch: moves this PC's static IP between LAN and Wi-Fi, or puts both back on DHCP.
 #   IpSwitch.ps1                 window (asks for admin once; without it each button asks)
 #   IpSwitch.ps1 -Apply Lan      switch from a shortcut/terminal (admin), also Wifi / Dhcp
 #   IpSwitch.ps1 -Apply Lan -DryRun   show what would change, no admin needed
@@ -124,7 +124,7 @@ function Get-IfState($ad) {
   }
 }
 
-# The IP this PC uses now, as settings defaults: a saved static IP first (that is the hospital IP),
+# The IP this PC uses now, as settings defaults: a saved static IP first (that is the IP to switch),
 # else the live address of a connected card with a gateway.
 function Get-CurrentIpSettings {
   $ads = @(Get-PhysicalAdapters)
@@ -168,7 +168,7 @@ function Get-CurrentSsid {
 }
 
 # Only the network chosen in settings or the last one a Wi-Fi switch worked on, never any saved network:
-# a phone hotspot in range would otherwise get the hospital IP.
+# a phone hotspot in range would otherwise get the static IP.
 function Connect-PreferredWifi($c) {
   $w = Get-WifiNetworks
   foreach ($ssid in @($c.WifiSsid, $c.LastWifiSsid) | Where-Object { $_ } | Select-Object -Unique) {
@@ -268,7 +268,7 @@ function Invoke-Mode([string]$mode) {
   }
   $ads = Resolve-Adapters $c
   # The card that gets the static IP must be usable before anything changes; otherwise LAN would already be on
-  # DHCP and the PC would end up with the hospital IP on neither card.
+  # DHCP and the PC would end up with the static IP on neither card.
   $target = @($Modes[$mode].Keys | Where-Object { $Modes[$mode][$_] -eq 'Static' })[0]
   if ($target -and -not $ads[$target]) { return @{ Ok = $false; Log = @("ไม่พบการ์ด $($ModeLabel[$target]) ในเครื่องนี้ จึงไม่ได้เปลี่ยนอะไร") } }
   # Windows silently keeps DHCP on for a Wi-Fi card that is not connected (every NetTCPIP/netsh call "succeeds"
@@ -514,7 +514,7 @@ public static class IpSwitchDwm {
         <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
         <Image x:Name="HeadIcon" Width="36" Height="36" Margin="0,2,12,0" VerticalAlignment="Top" RenderOptions.BitmapScalingMode="HighQuality"/>
         <StackPanel Grid.Column="1">
-          <TextBlock Text="สลับ IP โรงพยาบาล" FontSize="20" FontWeight="SemiBold"/>
+          <TextBlock Text="สลับ IP" FontSize="20" FontWeight="SemiBold"/>
           <TextBlock x:Name="Now" Foreground="#FF5C5C5C" TextWrapping="Wrap"/>
         </StackPanel>
       </Grid>
@@ -558,7 +558,7 @@ public static class IpSwitchDwm {
             <StackPanel>
               <TextBlock Text="&#xE774;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="22" Foreground="#FF0067C0"/>
               <TextBlock Text="อัตโนมัติ" FontSize="15" FontWeight="SemiBold" Margin="0,8,0,0"/>
-              <TextBlock Text="DHCP ทั้งคู่ ใช้นอก รพ." Foreground="#FF5C5C5C" FontSize="12" TextWrapping="Wrap"/>
+              <TextBlock Text="DHCP ทั้งสองการ์ด" Foreground="#FF5C5C5C" FontSize="12" TextWrapping="Wrap"/>
             </StackPanel>
             <Border x:Name="BadgeDhcp" Style="{StaticResource Badge}"><TextBlock Text="ใช้อยู่" Foreground="White" FontSize="11"/></Border>
           </Grid>
@@ -628,7 +628,7 @@ public static class IpSwitchDwm {
             <ComboBox x:Name="FLan" Grid.Row="5" Grid.Column="1"/>
             <TextBlock Grid.Row="6" Text="การ์ด Wi-Fi" VerticalAlignment="Center" Margin="0,0,0,6"/>
             <ComboBox x:Name="FWifi" Grid.Row="6" Grid.Column="1"/>
-            <TextBlock Grid.Row="7" Text="Wi-Fi ของ รพ." VerticalAlignment="Center" Margin="0,0,0,6"/>
+            <TextBlock Grid.Row="7" Text="Wi-Fi ที่ใช้" VerticalAlignment="Center" Margin="0,0,0,6"/>
             <ComboBox x:Name="FSsid" Grid.Row="7" Grid.Column="1"/>
             <DockPanel Grid.Row="8" Grid.ColumnSpan="2" Margin="0,4,0,0">
               <Button x:Name="SaveBtn" DockPanel.Dock="Right" Style="{StaticResource Btn}" Background="#FF0067C0" Foreground="White" Content="บันทึก"/>
@@ -641,9 +641,9 @@ public static class IpSwitchDwm {
 
       <DockPanel Margin="0,12,0,0">
         <Button x:Name="RefreshBtn" DockPanel.Dock="Right" Style="{StaticResource Btn}" Content="รีเฟรช"/>
-        <Button x:Name="CheckUpdBtn" DockPanel.Dock="Right" Style="{StaticResource Btn}" Margin="0,0,8,0" Content="ตรวจอัปเดต"/>
+        <Button x:Name="AboutBtn" DockPanel.Dock="Right" Style="{StaticResource Btn}" Margin="0,0,8,0" Content="เกี่ยวกับ"/>
         <TextBlock x:Name="Hint" Foreground="#FF5C5C5C" FontSize="12" TextWrapping="Wrap" VerticalAlignment="Center" Margin="0,0,10,0"
-                   Text="Static ที่ Wi-Fi ใช้กับทุกเครือข่าย Wi-Fi ออกนอก รพ. กด อัตโนมัติ"/>
+                   Text="Static ที่ Wi-Fi ใช้กับทุกเครือข่าย Wi-Fi ย้ายไปเครือข่ายอื่นให้กด อัตโนมัติ"/>
       </DockPanel>
     </StackPanel>
   </Border>
@@ -655,7 +655,7 @@ $ui = @{}
 foreach ($n in 'Root', 'HeadIcon', 'Now', 'TileLan', 'TileWifi', 'TileDhcp', 'BadgeLan', 'BadgeWifi', 'BadgeDhcp',
   'LanDot', 'LanName', 'LanInfo', 'LanPill', 'LanConn', 'WifiDot', 'WifiName', 'WifiInfo', 'WifiPill', 'WifiConn', 'LogCard', 'LogBar', 'Log', 'Busy',
   'Hint', 'SettingsBox', 'FSsid', 'ReadBtn', 'FIp', 'FMask', 'FGw', 'FDns1', 'FDns2', 'FLan', 'FWifi', 'SaveBtn', 'SaveMsg', 'RefreshBtn',
-  'UpdateCard', 'UpdateTitle', 'UpdateText', 'UpdateBtn', 'UpdateNotesBtn', 'CheckUpdBtn') { $ui[$n] = $win.FindName($n) }
+  'UpdateCard', 'UpdateTitle', 'UpdateText', 'UpdateBtn', 'UpdateNotesBtn', 'AboutBtn') { $ui[$n] = $win.FindName($n) }
 $win.Title = "IP Switch $AppVersion"
 $tiles = @{ Lan = $ui.TileLan; Wifi = $ui.TileWifi; Dhcp = $ui.TileDhcp }
 $badges = @{ Lan = $ui.BadgeLan; Wifi = $ui.BadgeWifi; Dhcp = $ui.BadgeDhcp }
@@ -721,7 +721,7 @@ function Update-Status {
   $ui.Now.Text = $(if ($snap.Current) { "ตอนนี้: $($ModeLabel[$snap.Current])" }
     elseif ($snap.Near) { "ตอนนี้: $($ModeLabel[$snap.Near]) แต่การ์ดอีกตัวมีค่าเก่าค้าง กด $($ModeLabel[$snap.Near]) อีกครั้งเพื่อล้าง" }
     else { 'ตอนนี้: ค่าไม่ตรงกับปุ่มไหน กดเลือกเพื่อจัดให้ถูก' })
-  $ui.Hint.Text = $(if (Test-Admin) { '' } else { 'กดปุ่มแล้ว Windows จะขอสิทธิ์ admin   ' }) + 'Static ที่ Wi-Fi ใช้กับทุกเครือข่าย Wi-Fi ออกนอก รพ. กด อัตโนมัติ'
+  $ui.Hint.Text = $(if (Test-Admin) { '' } else { 'กดปุ่มแล้ว Windows จะขอสิทธิ์ admin   ' }) + 'Static ที่ Wi-Fi ใช้กับทุกเครือข่าย Wi-Fi ย้ายไปเครือข่ายอื่นให้กด อัตโนมัติ'
 }
 
 function Fill-Settings {
@@ -749,7 +749,7 @@ function Fill-Settings {
       $ui.FIp.Text = $first.Ip; $ui.FMask.Text = $first.Mask; $ui.FGw.Text = $first.Gateway
       $ui.FDns1.Text = @($first.Dns)[0]; $ui.FDns2.Text = $(if ($first.Dns.Count -gt 1) { $first.Dns[1] } else { '' })
       $ui.SettingsBox.IsExpanded = $false
-      Set-Log '#FF0F7B0F' "บันทึก IP ของเครื่องนี้ให้แล้ว: $($first.Ip)  GW $($first.Gateway)  (อ่านจาก $($cur.From))`nถ้าไม่ใช่ IP ของ รพ. แก้ได้ใน ตั้งค่า IP ของเครื่องนี้"
+      Set-Log '#FF0F7B0F' "บันทึก IP ของเครื่องนี้ให้แล้ว: $($first.Ip)  GW $($first.Gateway)  (อ่านจาก $($cur.From))`nถ้าไม่ใช่ IP ที่ต้องการ แก้ได้ใน ตั้งค่า IP ของเครื่องนี้"
     }
     elseif (Fill-FromCurrent) { $ui.SaveMsg.Text += '  ตรวจแล้วกดบันทึก' } else { $ui.SaveMsg.Text = 'ใส่ IP ของเครื่องนี้ก่อนใช้ครั้งแรก' }
   }
@@ -795,7 +795,7 @@ $timer.Add_Tick({
     $j.PickerAt = $null
     if ((Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up') {
       Open-WifiPicker
-      $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`nเลือก Wi-Fi ของ รพ. ในรายการที่เด้งขึ้น (รอได้ 3 นาที)"
+      $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`nเลือก Wi-Fi ในรายการที่เด้งขึ้น (รอได้ 3 นาที)"
     }
   }
   # No time limit: switching back from Wi-Fi took 3.5 minutes once and still finished correctly.
@@ -836,7 +836,7 @@ function Start-Switch([string]$mode) {
     $ui.SettingsBox.IsExpanded = $true; $ui.SaveMsg.Foreground = & $brush '#FFC42B1C'; $ui.SaveMsg.Text = 'ใส่ IP แล้วกดบันทึกก่อน'; return
   }
   # Wi-Fi not connected: start connecting before the UAC prompt (no admin needed), so it is up by the time
-  # the switch runs. A saved hospital network connects by itself; otherwise the Windows Wi-Fi list opens.
+  # the switch runs. A saved network connects by itself; otherwise the Windows Wi-Fi list opens.
   $c = Read-Config
   $wait = ''; $pickerAt = $null; $wifiIndex = 0
   $wifi = (Resolve-Adapters $c)['Wifi']
@@ -844,7 +844,7 @@ function Start-Switch([string]$mode) {
     $wifiIndex = $wifi.ifIndex
     $ssid = Connect-PreferredWifi $c
     if ($ssid) { $wait = "`nกำลังเชื่อมต่อ $ssid (บันทึกไว้แล้ว)"; $pickerAt = [DateTime]::Now.AddSeconds(25) }
-    else { Open-WifiPicker; $wait = "`nเลือก Wi-Fi ของ รพ. ในรายการที่เด้งขึ้น (รอได้ 3 นาที)" }
+    else { Open-WifiPicker; $wait = "`nเลือก Wi-Fi ในรายการที่เด้งขึ้น (รอได้ 3 นาที)" }
   }
   $file = [IO.Path]::GetTempFileName()
   $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Apply $mode -ResultFile `"$file`"$SelfArgs"
@@ -884,7 +884,7 @@ function Start-UpdateJob([string]$phase, [string]$body) {
 function Start-UpdateCheck([switch]$Manual) {
   if ($script:updJob) { return }
   $script:updManual = [bool]$Manual
-  if ($Manual) { $ui.CheckUpdBtn.IsEnabled = $false; $ui.CheckUpdBtn.Content = 'กำลังตรวจ...' }
+  if ($Manual) { Set-Log '#FF0067C0' 'กำลังตรวจอัปเดต...' -Busy }
   Start-UpdateJob 'check' 'Get-UpdateInfo | ConvertTo-Json -Compress'
 }
 
@@ -896,7 +896,6 @@ $updTimer.Add_Tick({
   try { $out = Receive-Job $j -ErrorAction Stop } catch { $err = $_.Exception.Message }
   if (-not $err -and $j.State -ne 'Completed') { $err = "$($j.ChildJobs[0].JobStateInfo.Reason.Message)" }
   Remove-Job $j -Force; $script:updJob = $null
-  $ui.CheckUpdBtn.IsEnabled = $true; $ui.CheckUpdBtn.Content = 'ตรวจอัปเดต'
   if ($script:updPhase -eq 'check') {
     if ($err -or -not $out) { if ($script:updManual) { Set-Log '#FFC42B1C' "ตรวจอัปเดตไม่ได้: $err" }; return }
     $script:upd = $out | ConvertFrom-Json
@@ -906,6 +905,7 @@ $updTimer.Add_Tick({
     $ui.UpdateText.Text = $lines -join "`n"
     $ui.UpdateBtn.Content = $(if ($ExePath) { 'อัปเดตเลย' } else { 'ดาวน์โหลด' })
     $ui.UpdateCard.Visibility = 'Visible'
+    if ($script:updManual) { $ui.LogCard.Visibility = 'Collapsed' }
   } else {
     if ($err) { $ui.UpdateBtn.IsEnabled = $true; Set-Log '#FFC42B1C' "อัปเดตไม่ได้: $err"; return }
     # the new exe unpacks its own version and opens a fresh window; this one closes
@@ -914,7 +914,83 @@ $updTimer.Add_Tick({
   }
 })
 
-$ui.CheckUpdBtn.Add_Click({ Start-UpdateCheck -Manual })
+# About: what this is, who made it, where it runs from and keeps its settings; update check lives here too.
+function Show-About {
+  [xml]$ax = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="เกี่ยวกับ IP Switch" Width="460" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#FFF7F7F7"
+        FontFamily="Segoe UI Variable Text, Segoe UI, Leelawadee UI" FontSize="13" Foreground="#FF1B1B1B">
+  <Window.Resources>
+    <Style TargetType="Button">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Background" Value="#FFFFFFFF"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" CornerRadius="4" Background="{TemplateBinding Background}" BorderBrush="#1F000000" BorderThickness="1" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#FFF0F0F0"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <StackPanel Margin="24,20,24,20">
+    <Grid Margin="0,0,0,14">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <Image x:Name="AIcon" Width="48" Height="48" Margin="0,0,14,0" VerticalAlignment="Top" RenderOptions.BitmapScalingMode="HighQuality"/>
+      <StackPanel Grid.Column="1">
+        <TextBlock Text="IP Switch" FontSize="20" FontWeight="SemiBold"/>
+        <TextBlock x:Name="AVer" Foreground="#FF5C5C5C"/>
+      </StackPanel>
+    </Grid>
+    <TextBlock TextWrapping="Wrap" Margin="0,0,0,14" Text="สลับ IP static ระหว่างสาย LAN, Wi-Fi และ DHCP ด้วยการกดปุ่มเดียว ล้าง gateway และ DNS เก่าที่ค้างให้ และต่อ Wi-Fi ที่เคยใช้ให้เอง"/>
+    <Border Background="#FFFFFFFF" BorderBrush="#14000000" BorderThickness="1" CornerRadius="8" Padding="14,10">
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition/></Grid.ColumnDefinitions>
+        <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+        <TextBlock Text="ผู้พัฒนา" Foreground="#FF5C5C5C" Margin="0,0,0,8"/>
+        <TextBlock Grid.Column="1" TextWrapping="Wrap" Margin="0,0,0,8" Text="DevTeam, Information Technology&#x0a;Faculty of Medicine Ramathibodi Hospital, Mahidol University"/>
+        <TextBlock Grid.Row="1" Text="เวอร์ชัน" Foreground="#FF5C5C5C" Margin="0,0,0,8"/>
+        <TextBlock x:Name="AVer2" Grid.Row="1" Grid.Column="1" Margin="0,0,0,8"/>
+        <TextBlock Grid.Row="2" Text="ตัวโปรแกรม" Foreground="#FF5C5C5C" Margin="0,0,0,8"/>
+        <TextBlock x:Name="AExe" Grid.Row="2" Grid.Column="1" TextWrapping="Wrap" FontFamily="Cascadia Mono, Consolas" FontSize="12" Margin="0,0,0,8"/>
+        <TextBlock Grid.Row="3" Text="เก็บค่าที่" Foreground="#FF5C5C5C" Margin="0,0,0,8"/>
+        <TextBlock x:Name="AData" Grid.Row="3" Grid.Column="1" TextWrapping="Wrap" FontFamily="Cascadia Mono, Consolas" FontSize="12" Margin="0,0,0,8"/>
+        <TextBlock Grid.Row="4" Text="ระบบ" Foreground="#FF5C5C5C"/>
+        <TextBlock x:Name="ASys" Grid.Row="4" Grid.Column="1" TextWrapping="Wrap"/>
+      </Grid>
+    </Border>
+    <DockPanel Margin="0,16,0,0">
+      <Button x:Name="ACloseBtn" DockPanel.Dock="Right" Content="ปิด" Padding="18,5" IsCancel="True"/>
+      <Button x:Name="AUpdBtn" DockPanel.Dock="Right" Content="ตรวจอัปเดต" Padding="14,5" Margin="0,0,8,0"/>
+      <Button x:Name="AFolderBtn" DockPanel.Dock="Left" Content="เปิดโฟลเดอร์ที่เก็บค่า" Padding="14,5" HorizontalAlignment="Left"/>
+    </DockPanel>
+  </StackPanel>
+</Window>
+'@
+  $aw = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $ax))
+  $aw.Owner = $win
+  if ($ui.HeadIcon.Source) { $aw.FindName('AIcon').Source = $ui.HeadIcon.Source; $aw.Icon = $win.Icon }
+  $kind = $(if ($ExePath) { 'ตัว portable' } else { 'สคริปต์' })
+  $aw.FindName('AVer').Text = "เวอร์ชัน $AppVersion  ($kind)"
+  $aw.FindName('AVer2').Text = $AppVersion
+  $aw.FindName('AExe').Text = $(if ($ExePath) { $ExePath } else { $PSCommandPath })
+  $aw.FindName('AData').Text = $ConfigPath
+  $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+  $aw.FindName('ASys').Text = "$($os.Caption) $($os.BuildNumber)  ·  PowerShell $($PSVersionTable.PSVersion)  ·  admin: $(if (Test-Admin) { 'ใช่' } else { 'ไม่ใช่' })"
+  $aw.FindName('AFolderBtn').Add_Click({ Start-Process explorer.exe "/select,`"$ConfigPath`"" })
+  $aw.FindName('AUpdBtn').Add_Click({ $aw.Close(); Start-UpdateCheck -Manual })
+  $aw.FindName('ACloseBtn').Add_Click({ $aw.Close() })
+  [void]$aw.ShowDialog()
+}
+
+$ui.AboutBtn.Add_Click({ Show-About })
 $ui.UpdateNotesBtn.Add_Click({ if ($script:upd) { Start-Process $script:upd.Page } })
 $ui.UpdateBtn.Add_Click({
   if (-not $script:upd) { return }
