@@ -1,0 +1,6 @@
+# this PC's own settings and logs (IP address, Wi-Fi name) never go into the repo
+config.json
+last-run.log
+dist/*
+!dist/IpSwitch.exe
+*.download
