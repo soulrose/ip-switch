@@ -276,15 +276,29 @@ function Invoke-Mode([string]$mode) {
   if ($target -eq 'Wifi' -and -not $DryRun) {
     $ad = $ads['Wifi']
     if ($ad.Status -ne 'Up' -and -not (Test-Desired (Get-IfState $ad) 'Static' $c)) {
-      if ($ad.Status -eq 'Disabled') { Enable-NetAdapter -Name $ad.Name -Confirm:$false; $log.Add("เปิดการ์ด $($ad.Name)") }
+      $wasDisabled = $ad.Status -eq 'Disabled'
+      if ($wasDisabled) { Enable-NetAdapter -Name $ad.Name -Confirm:$false; $log.Add("เปิดการ์ด $($ad.Name)") }
       # From the window the connect/picker is done by the window itself; from the command line do it here.
       if (-not $ResultFile) {
         $ssid = Connect-PreferredWifi $c
         if ($ssid) { $log.Add("เชื่อมต่อ $ssid ที่บันทึกไว้") } else { Open-WifiPicker; $log.Add('เปิดรายการ Wi-Fi ให้เลือก') }
       }
-      foreach ($w in 1..$WaitSeconds) { Start-Sleep -Seconds 1; $ad = Get-NetAdapter -InterfaceIndex $ad.ifIndex; if ($ad.Status -eq 'Up') { break } }
-      if ($ad.Status -ne 'Up') {
-        $log.Add("$($ad.Name) ยังไม่ได้เชื่อมต่อ จึงยังไม่ได้เปลี่ยนอะไร LAN ยังเหมือนเดิม เชื่อมต่อ Wi-Fi แล้วกดอีกครั้ง")
+      # The window asks to cancel by creating <result file>.cancel (it cannot stop this process when it runs as admin).
+      $cancelFile = $(if ($ResultFile) { "$ResultFile.cancel" })
+      $cancelled = $false
+      foreach ($w in 1..$WaitSeconds) {
+        Start-Sleep -Seconds 1
+        if ($cancelFile -and (Test-Path -LiteralPath $cancelFile)) { $cancelled = $true; break }
+        $ad = Get-NetAdapter -InterfaceIndex $ad.ifIndex; if ($ad.Status -eq 'Up') { break }
+      }
+      if ($cancelled -or $ad.Status -ne 'Up') {
+        # Cancelled or nobody picked a network in time: put Wi-Fi back as it was before the press
+        # (stop the connection attempt, switch the card off again if it was off). LAN was never touched.
+        netsh.exe wlan disconnect interface="$($ad.Name)" | Out-Null
+        if ($wasDisabled) { Disable-NetAdapter -Name $ad.Name -Confirm:$false }
+        $back = $(if ($wasDisabled) { 'ปิดการ์ด Wi-Fi กลับเหมือนเดิม' } else { 'ตัด Wi-Fi กลับเหมือนเดิม' })
+        if ($cancelled) { return @{ Ok = $false; Cancelled = $true; Log = @("ยกเลิกแล้ว ไม่ได้เปลี่ยนอะไร LAN ยังเหมือนเดิม ($back)") } }
+        $log.Add("หมดเวลา $WaitSeconds วินาที ยังไม่ได้เลือก Wi-Fi จึงกลับเป็นแบบเดิม LAN ไม่ได้เปลี่ยน ($back)")
         $since = (Get-Date).AddMinutes(-5)
         $fail = @(11006, 8002 | ForEach-Object { Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = $_; StartTime = $since } -MaxEvents 1 -ErrorAction SilentlyContinue })[0]
         if ($fail) {
@@ -603,6 +617,10 @@ public static class IpSwitchDwm {
           <StackPanel Grid.Column="1" Margin="12,10,12,10">
             <TextBlock x:Name="Log" TextWrapping="Wrap" LineHeight="20"/>
             <ProgressBar x:Name="Busy" IsIndeterminate="True" Height="3" Margin="0,8,0,0" BorderThickness="0" Background="Transparent" Foreground="#FF0067C0" Visibility="Collapsed"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+              <Button x:Name="CancelBtn" Style="{StaticResource Btn}" Content="ยกเลิก" Visibility="Collapsed" ToolTip="หยุดรอ Wi-Fi และกลับเป็นแบบเดิม ยังไม่มีอะไรถูกเปลี่ยน"/>
+              <Button x:Name="UndoBtn" Style="{StaticResource Btn}" Visibility="Collapsed"/>
+            </StackPanel>
           </StackPanel>
         </Grid>
       </Border>
@@ -653,7 +671,7 @@ public static class IpSwitchDwm {
 $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
 foreach ($n in 'Root', 'HeadIcon', 'Now', 'TileLan', 'TileWifi', 'TileDhcp', 'BadgeLan', 'BadgeWifi', 'BadgeDhcp',
-  'LanDot', 'LanName', 'LanInfo', 'LanPill', 'LanConn', 'WifiDot', 'WifiName', 'WifiInfo', 'WifiPill', 'WifiConn', 'LogCard', 'LogBar', 'Log', 'Busy',
+  'LanDot', 'LanName', 'LanInfo', 'LanPill', 'LanConn', 'WifiDot', 'WifiName', 'WifiInfo', 'WifiPill', 'WifiConn', 'LogCard', 'LogBar', 'Log', 'Busy', 'CancelBtn', 'UndoBtn',
   'Hint', 'SettingsBox', 'FSsid', 'ReadBtn', 'FIp', 'FMask', 'FGw', 'FDns1', 'FDns2', 'FLan', 'FWifi', 'SaveBtn', 'SaveMsg', 'RefreshBtn',
   'UpdateCard', 'UpdateTitle', 'UpdateText', 'UpdateBtn', 'UpdateNotesBtn', 'AboutBtn') { $ui[$n] = $win.FindName($n) }
 $win.Title = "IP Switch $AppVersion"
@@ -795,22 +813,33 @@ $timer.Add_Tick({
     $j.PickerAt = $null
     if ((Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up') {
       Open-WifiPicker
-      $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`nเลือก Wi-Fi ในรายการที่เด้งขึ้น (รอได้ 3 นาที)"
+      $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`nเลือก Wi-Fi ในรายการที่เด้งขึ้น ไม่เลือกภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"
     }
   }
   # No time limit: switching back from Wi-Fi took 3.5 minutes once and still finished correctly.
   $exited = $true
   try { $exited = $j.Proc.HasExited } catch {}
   if (-not $exited -and $sec -lt 600) {
-    if ($sec -ne $j.Shown) { $j.Shown = $sec; $ui.Log.Text = "$($j.Text)`nผ่านไป $sec วินาที" }
+    if ($sec -ne $j.Shown) {
+      $j.Shown = $sec; $ui.Log.Text = "$($j.Text)`nผ่านไป $sec วินาที"
+      # Cancel is offered only while it still waits for Wi-Fi; once Wi-Fi is up the switch itself starts.
+      $waiting = $j.WifiIndex -and -not $j.CancelAsked -and (Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up'
+      $ui.CancelBtn.Visibility = $(if ($waiting) { 'Visible' } else { 'Collapsed' })
+    }
     return
   }
   $timer.Stop()
   $r = $null
   try { $r = [IO.File]::ReadAllText($j.File, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
-  Remove-Item $j.File -ErrorAction SilentlyContinue
+  Remove-Item $j.File, "$($j.File).cancel" -ErrorAction SilentlyContinue
   if ($r) {
-    Set-Log $(if ($r.Ok) { '#FF0F7B0F' } else { '#FFC42B1C' }) ($r.Log -join "`n")
+    Set-Log $(if ($r.Ok) { '#FF0F7B0F' } elseif ($r.Cancelled) { '#FF8A8A8A' } else { '#FFC42B1C' }) ($r.Log -join "`n")
+    # One click back to the mode it was in before this switch.
+    if ($r.Ok -and $j.Prev -and $j.Prev -ne $j.Mode) {
+      $script:undoMode = $j.Prev
+      $ui.UndoBtn.Content = "กลับเป็น $($ModeLabel[$j.Prev])"
+      $ui.UndoBtn.Visibility = 'Visible'
+    }
   } else {
     $code = '?'; try { $code = $j.Proc.ExitCode } catch {}
     $tail = ''; try { $tail = (Get-Content -LiteralPath (Join-Path $DataDir 'last-run.log') -Encoding UTF8 -Tail 4) -join "`n" } catch {}
@@ -827,6 +856,7 @@ function Set-Log($color, [string]$text, [switch]$Busy) {
   $ui.Log.Foreground = & $brush $(if ($color -eq '#FFC42B1C') { '#FFA4262C' } else { '#FF1B1B1B' })
   $ui.Log.Text = $text
   $ui.Busy.Visibility = $(if ($Busy) { 'Visible' } else { 'Collapsed' })
+  $ui.CancelBtn.Visibility = 'Collapsed'; $ui.UndoBtn.Visibility = 'Collapsed'
   $ui.LogCard.Visibility = 'Visible'
 }
 
@@ -838,13 +868,15 @@ function Start-Switch([string]$mode) {
   # Wi-Fi not connected: start connecting before the UAC prompt (no admin needed), so it is up by the time
   # the switch runs. A saved network connects by itself; otherwise the Windows Wi-Fi list opens.
   $c = Read-Config
+  $before = Get-Snapshot $c
+  $prev = $(if ($before.Current) { $before.Current } else { $before.Near })
   $wait = ''; $pickerAt = $null; $wifiIndex = 0
   $wifi = (Resolve-Adapters $c)['Wifi']
   if ($mode -eq 'Wifi' -and $wifi -and $wifi.Status -ne 'Up') {
     $wifiIndex = $wifi.ifIndex
     $ssid = Connect-PreferredWifi $c
     if ($ssid) { $wait = "`nกำลังเชื่อมต่อ $ssid (บันทึกไว้แล้ว)"; $pickerAt = [DateTime]::Now.AddSeconds(25) }
-    else { Open-WifiPicker; $wait = "`nเลือก Wi-Fi ในรายการที่เด้งขึ้น (รอได้ 3 นาที)" }
+    else { Open-WifiPicker; $wait = "`nเลือก Wi-Fi ในรายการที่เด้งขึ้น ไม่เลือกภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)" }
   }
   $file = [IO.Path]::GetTempFileName()
   $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Apply $mode -ResultFile `"$file`"$SelfArgs"
@@ -858,13 +890,23 @@ function Start-Switch([string]$mode) {
   foreach ($t in $tiles.Values) { $t.IsEnabled = $false }
   $text = "กำลังเปลี่ยนเป็น $($ModeLabel[$mode]) ...$wait"
   Set-Log '#FF0067C0' $text -Busy
-  $script:job = @{ Proc = $p; File = $file; Start = [DateTime]::Now; Text = $text; Shown = -1; PickerAt = $pickerAt; WifiIndex = $wifiIndex }
+  $script:job = @{ Proc = $p; File = $file; Start = [DateTime]::Now; Text = $text; Shown = -1; PickerAt = $pickerAt; WifiIndex = $wifiIndex
+                   Mode = $mode; Prev = $prev; CancelAsked = $false }
   $timer.Start()
 }
 
 $ui.TileLan.Add_Click({ Start-Switch 'Lan' })
 $ui.TileWifi.Add_Click({ Start-Switch 'Wifi' })
 $ui.TileDhcp.Add_Click({ Start-Switch 'Dhcp' })
+$ui.CancelBtn.Add_Click({
+  $j = $script:job
+  if (-not $j -or $j.CancelAsked) { return }
+  $j.CancelAsked = $true; $j.PickerAt = $null
+  try { [IO.File]::WriteAllText("$($j.File).cancel", '') } catch {}
+  $ui.CancelBtn.Visibility = 'Collapsed'
+  $j.Text = 'กำลังยกเลิก และคืน Wi-Fi เป็นแบบเดิม ...'; $j.Shown = -1
+})
+$ui.UndoBtn.Add_Click({ if ($script:undoMode) { Start-Switch $script:undoMode } })
 $ui.RefreshBtn.Add_Click({ Update-Status })
 
 # Update check and download run as background jobs so the window never waits on the network.
