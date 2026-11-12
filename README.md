@@ -19,6 +19,15 @@
 
 ค่าที่ตั้งเก็บไว้ใน `config.json` ในโฟลเดอร์นี้ ถ้าเครื่องมีการ์ด LAN หลายตัว (เช่น dock USB) เลือกการ์ดเองได้ในหน้าตั้งค่า
 
+## ดาวน์โหลด
+
+หน้า Releases: <https://github.com/soulrose/ip-switch/releases/latest> มี 2 แบบ
+
+- **IpSwitch-Setup.exe** ติดตั้งที่ `%LOCALAPPDATA%\Programs\IpSwitch` สร้างไอคอนบน Desktop กับเมนู Start และถอนการติดตั้งได้จาก Settings > Apps ไม่ต้องใช้สิทธิ์ admin ตอนติดตั้ง ติดตั้งทับเวอร์ชันเก่าได้ ค่า IP เดิมยังอยู่
+- **IpSwitch.exe** ตัว portable ไฟล์เดียว ไม่ต้องติดตั้ง
+
+ทั้งสองแบบอัปเดตตัวเองได้จากในโปรแกรม (ตัวที่ติดตั้งคือตัว portable ที่วางไว้ในโฟลเดอร์โปรแกรม) ติดตั้งแบบเงียบ: `IpSwitch-Setup.exe /silent [/dir=...] [/noicons] [/open]`
+
 ## ตัว portable ให้เครื่องอื่น
 
 ส่งไฟล์เดียว `dist\IpSwitch.exe` ให้เพื่อน หรือโหลดจาก <https://github.com/soulrose/ip-switch/raw/main/dist/IpSwitch.exe> ไม่ต้องติดตั้ง ดับเบิลคลิกเปิดได้เลย (วางไว้ใน USB หรือโฟลเดอร์ไหนก็ได้)
@@ -44,7 +53,11 @@
    ```bat
    powershell -ExecutionPolicy Bypass -File portable\build-portable.ps1
    ```
-3. commit แล้ว push พร้อม tag `v<เลขเวอร์ชัน>` ทุกเครื่องจะเห็นเวอร์ชันใหม่จาก tag นี้
+3. สร้างตัว setup (ใช้ `dist\IpSwitch.exe` จากข้อ 2):
+   ```bat
+   powershell -ExecutionPolicy Bypass -File installer\build-setup.ps1
+   ```
+4. commit แล้ว push พร้อม tag `v<เลขเวอร์ชัน>` ทุกเครื่องจะเห็นเวอร์ชันใหม่จาก tag นี้ แล้วสร้าง Release ของ tag นั้น แนบ `dist\IpSwitch-Setup.exe` และ `dist\IpSwitch.exe`
    ```bat
    git tag v1.3.0
    git push origin main --tags
