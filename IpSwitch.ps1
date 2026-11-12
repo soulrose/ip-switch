@@ -893,7 +893,7 @@ $timer.Add_Tick({
     $j.ChooserAt = $null
     if ((Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up') {
       $timer.Stop()
-      $pick = Show-WifiChooser (Read-Config) 'เชื่อมต่อ Wi-Fi ที่เลือกไว้ไม่ได้ เลือกเครือข่ายอื่น หรือกดยกเลิกเพื่อกลับเป็นแบบเดิม'
+      $pick = Show-WifiChooser (Read-Config) 'เชื่อมต่อ Wi-Fi ที่เลือกไว้ไม่ได้ เลือกเครือข่ายอื่น หรือกดยกเลิกเพื่อกลับเป็นแบบเดิม' -NoPreselect
       $timer.Start()
       if (-not $pick) { Request-Cancel; return }
       $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`n$(Use-WifiChoice $pick)`nไม่ติดภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"; $j.Shown = -1
@@ -951,7 +951,7 @@ function Set-Log($color, [string]$text, [switch]$Busy) {
 
 # In-window Wi-Fi list, shown before anything changes when no preferred network can be joined. Returns
 # @{ Ssid; Saved } or $null (closed / cancelled). Nothing is switched while it is open.
-function Show-WifiChooser($c, [string]$why) {
+function Show-WifiChooser($c, [string]$why, [switch]$NoPreselect) {
   [xml]$cx = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -1001,19 +1001,24 @@ function Show-WifiChooser($c, [string]$why) {
     $nets.Items.Clear()
     $w = Get-WifiNetworks
     $prefixes = @("$($c.WifiAuto)" -split '\s*,\s*' | Where-Object { $_ })
-    foreach ($s in @($w.Visible.Keys | Sort-Object { $w.Visible[$_] } -Descending)) {
+    $isMatch = { param($s) [bool]@($prefixes | Where-Object { $s.Trim().StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count }
+    # networks named like the auto-connect names first (also never-joined ones: a new PC signs in to them once),
+    # then the rest, each group strongest first
+    foreach ($s in @($w.Visible.Keys | Sort-Object @{ Expression = { -not (& $isMatch $_) } }, @{ Expression = { $w.Visible[$_] }; Descending = $true })) {
       $saved = $w.Saved -contains $s
+      $match = & $isMatch $s
       $row = New-Object Windows.Controls.DockPanel
       $right = New-Object Windows.Controls.TextBlock
-      $right.Text = $(if ($saved) { "เคยใช้   $($w.Visible[$s])%" } else { "$($w.Visible[$s])%" })
-      $right.Foreground = & $brush '#FF5C5C5C'; $right.Margin = '12,0,0,0'
+      $tags = @($(if ($match) { 'แนะนำ' }), $(if ($saved) { 'เคยใช้' } elseif ($match) { 'ต้องเข้าสู่ระบบครั้งแรก' }) | Where-Object { $_ })
+      $right.Text = (@($tags) + "$($w.Visible[$s])%") -join '   '
+      $right.Foreground = & $brush $(if ($match) { '#FF0067C0' } else { '#FF5C5C5C' }); $right.Margin = '12,0,0,0'
       [Windows.Controls.DockPanel]::SetDock($right, 'Right')
       $name = New-Object Windows.Controls.TextBlock
       $name.Text = $(if ($s.Trim()) { $s } else { '(ไม่มีชื่อ)' }); $name.TextTrimming = 'CharacterEllipsis'
-      if ($saved) { $name.FontWeight = 'SemiBold' }
+      if ($saved -or $match) { $name.FontWeight = 'SemiBold' }
       [void]$row.Children.Add($right); [void]$row.Children.Add($name)
       $item = New-Object Windows.Controls.ListBoxItem
-      $item.Content = $row; $item.Padding = '8,7'; $item.Tag = @{ Ssid = $s; Saved = $saved }
+      $item.Content = $row; $item.Padding = '8,7'; $item.HorizontalContentAlignment = 'Stretch'; $item.Tag = @{ Ssid = $s; Saved = $saved }
       [void]$nets.Items.Add($item)
     }
     if (-not $nets.Items.Count) {
@@ -1021,11 +1026,12 @@ function Show-WifiChooser($c, [string]$why) {
       $none.Content = 'ไม่เจอ Wi-Fi ในระยะ กดรีเฟรช'; $none.IsEnabled = $false; $none.Padding = '8,7'
       [void]$nets.Items.Add($none)
     }
-    # preselect a saved network that matches the auto-connect names, else the strongest saved, else the first
-    $pre = @($nets.Items | Where-Object { $_.Tag -and $_.Tag.Saved -and ($t = $_.Tag.Ssid) -and @($prefixes | Where-Object { $t.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count })[0]
-    if (-not $pre) { $pre = @($nets.Items | Where-Object { $_.Tag -and $_.Tag.Saved })[0] }
-    if (-not $pre) { $pre = @($nets.Items | Where-Object { $_.Tag })[0] }
+    # Only a network named like the auto-connect names is preselected (one press = join it, or sign in to it the
+    # first time); any other saved network might have a stale password, so Enter never picks one of those.
+    # After a failed join nothing is preselected, so the same network is not offered straight back.
+    $pre = $(if (-not $NoPreselect) { @($nets.Items | Where-Object { $_.Tag -and (& $isMatch $_.Tag.Ssid) })[0] })
     $nets.SelectedItem = $pre
+    $ok.IsEnabled = [bool]$pre
   }
   $accept = { $sel = $nets.SelectedItem; if ($sel -and $sel.Tag) { $script:wifiPick = $sel.Tag; $cw.Close() } }
   $ok.Add_Click($accept)
