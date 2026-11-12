@@ -1154,6 +1154,8 @@ $updTimer.Add_Tick({
     $ui.UpdateBtn.Content = $(if ($ExePath) { 'อัปเดตเลย' } else { 'ดาวน์โหลด' })
     $ui.UpdateCard.Visibility = 'Visible'
     if ($script:updManual) { $ui.LogCard.Visibility = 'Collapsed' }
+    # not in the middle of a switch: a modal window then would hide its progress
+    if (-not $script:job) { Show-UpdateAlert }
   } else {
     if ($err) { $ui.UpdateBtn.IsEnabled = $true; Set-Log '#FFC42B1C' "อัปเดตไม่ได้: $err"; return }
     # the new exe unpacks its own version and opens a fresh window; this one closes
@@ -1240,7 +1242,7 @@ function Show-About {
 
 $ui.AboutBtn.Add_Click({ Show-About })
 $ui.UpdateNotesBtn.Add_Click({ if ($script:upd) { Start-Process $script:upd.Page } })
-$ui.UpdateBtn.Add_Click({
+function Start-Update {
   if (-not $script:upd) { return }
   if (-not $ExePath) { Start-Process $script:upd.ExeUrl; return }
   if ($script:updJob -or $script:job) { return }
@@ -1248,7 +1250,74 @@ $ui.UpdateBtn.Add_Click({
   Set-Log '#FF0067C0' "กำลังดาวน์โหลด $($script:upd.Latest) ..." -Busy
   $url = $script:upd.ExeUrl -replace "'", "''"; $exe = $ExePath -replace "'", "''"
   Start-UpdateJob 'install' "Install-Update '$url' '$exe'"
-})
+}
+$ui.UpdateBtn.Add_Click({ Start-Update })
+
+# An old version says so in a window of its own, not only in the banner that is easy to miss.
+function Show-UpdateAlert {
+  if (-not $win.IsVisible) { $script:alertPending = $true; return }
+  $script:alertPending = $false
+  [xml]$ux = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="มีเวอร์ชันใหม่" Width="440" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#FFF7F7F7"
+        FontFamily="Segoe UI Variable Text, Segoe UI, Leelawadee UI" FontSize="13" Foreground="#FF1B1B1B">
+  <Window.Resources>
+    <Style TargetType="Button">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Background" Value="#FFFFFFFF"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" CornerRadius="4" Background="{TemplateBinding Background}" BorderBrush="#1F000000" BorderThickness="1" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.85"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <StackPanel Margin="24,20,24,20">
+    <Grid Margin="0,0,0,12">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <Image x:Name="UIcon" Width="40" Height="40" Margin="0,0,14,0" VerticalAlignment="Top" RenderOptions.BitmapScalingMode="HighQuality"/>
+      <StackPanel Grid.Column="1">
+        <TextBlock x:Name="UHead" FontSize="18" FontWeight="SemiBold"/>
+        <TextBlock x:Name="USub" Foreground="#FF5C5C5C"/>
+      </StackPanel>
+    </Grid>
+    <Border Background="#FFFFFFFF" BorderBrush="#14000000" BorderThickness="1" CornerRadius="8" Padding="14,10">
+      <TextBlock x:Name="UNotes" TextWrapping="Wrap" LineHeight="20"/>
+    </Border>
+    <TextBlock x:Name="UHint" Foreground="#FF5C5C5C" TextWrapping="Wrap" Margin="0,10,0,0"/>
+    <DockPanel Margin="0,16,0,0">
+      <Button x:Name="UYes" DockPanel.Dock="Right" Padding="18,5" Background="#FF0067C0" Foreground="White" IsDefault="True"/>
+      <Button x:Name="UNo" DockPanel.Dock="Right" Content="ภายหลัง" Padding="14,5" Margin="0,0,8,0" IsCancel="True"/>
+      <Button x:Name="UPage" DockPanel.Dock="Left" Content="ดูรายละเอียด" Padding="14,5" HorizontalAlignment="Left"/>
+    </DockPanel>
+  </StackPanel>
+</Window>
+'@
+  $uw = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $ux))
+  $uw.Owner = $win
+  if ($ui.HeadIcon.Source) { $uw.FindName('UIcon').Source = $ui.HeadIcon.Source; $uw.Icon = $win.Icon }
+  $uw.FindName('UHead').Text = "IP Switch $($script:upd.Latest) พร้อมใช้งาน"
+  $uw.FindName('USub').Text = "เครื่องนี้ใช้เวอร์ชัน $AppVersion"
+  $uw.FindName('UNotes').Text = $(if ($ui.UpdateText.Text) { $ui.UpdateText.Text } else { 'มีการแก้ไขและปรับปรุง' })
+  $uw.FindName('UHint').Text = $(if ($ExePath) { 'กดอัปเดตแล้วโปรแกรมจะโหลดเวอร์ชันใหม่มาแทนและเปิดใหม่ให้ ค่า IP ของเครื่องยังอยู่' } else { 'ตัวนี้เปิดจากสคริปต์ กดแล้วจะโหลดตัว portable เวอร์ชันใหม่' })
+  $yes = $uw.FindName('UYes'); $yes.Content = $(if ($ExePath) { 'อัปเดตเลย' } else { 'ดาวน์โหลด' })
+  $script:alertYes = $false
+  $yes.Add_Click({ $script:alertYes = $true; $uw.Close() })
+  $uw.FindName('UNo').Add_Click({ $uw.Close() })
+  $uw.FindName('UPage').Add_Click({ Start-Process $script:upd.Page })
+  [void]$uw.ShowDialog()
+  if ($script:alertYes) { Start-Update }
+}
+$win.Add_ContentRendered({ if ($script:alertPending) { Show-UpdateAlert } })
 $win.Add_Activated({ if (-not $script:job) { Update-Status } })
 
 Fill-Settings
