@@ -37,7 +37,7 @@ function Test-Admin {
 
 # ---------- config ----------
 function Get-DefaultConfig {
-  [pscustomobject]@{ Ip = ''; Mask = '255.255.255.0'; Gateway = ''; Dns = @(); LanAdapter = ''; WifiAdapter = ''; WifiSsid = ''; LastWifiSsid = '' }
+  [pscustomobject]@{ Ip = ''; Mask = '255.255.255.0'; Gateway = ''; Dns = @(); LanAdapter = ''; WifiAdapter = ''; WifiSsid = ''; LastWifiSsid = ''; WifiAuto = 'RAMA-BACK' }
 }
 
 function Read-Config {
@@ -167,20 +167,75 @@ function Get-CurrentSsid {
   return ''
 }
 
-# Only the network chosen in settings or the last one a Wi-Fi switch worked on, never any saved network:
-# a phone hotspot in range would otherwise get the static IP.
-function Connect-PreferredWifi($c) {
-  $w = Get-WifiNetworks
-  foreach ($ssid in @($c.WifiSsid, $c.LastWifiSsid) | Where-Object { $_ } | Select-Object -Unique) {
-    if ($w.Saved -contains $ssid -and $w.Visible.ContainsKey($ssid)) {
-      netsh.exe wlan connect name="$ssid" | Out-Null
-      return $ssid
-    }
-  }
+# Which saved network in range to connect, never just any saved one (a phone hotspot in range would otherwise get
+# the static IP): the one chosen in settings, else the strongest whose name starts with a WifiAuto prefix,
+# else the last one a Wi-Fi switch worked on. '' = ask the user.
+function Find-PreferredWifi($c, $w) {
+  $usable = { param($s) $s -and $w.Saved -contains $s -and $w.Visible.ContainsKey($s) }
+  if (& $usable $c.WifiSsid) { return $c.WifiSsid }
+  $prefixes = @("$($c.WifiAuto)" -split '\s*,\s*' | Where-Object { $_ })
+  $hit = @($w.Visible.Keys | Where-Object {
+      $s = $_; (& $usable $s) -and @($prefixes | Where-Object { $s.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count
+    } | Sort-Object { $w.Visible[$_] } -Descending)[0]
+  if ($hit) { return $hit }
+  if (& $usable $c.LastWifiSsid) { return $c.LastWifiSsid }
   return ''
 }
 
+function Connect-PreferredWifi($c) {
+  $ssid = Find-PreferredWifi $c (Get-WifiNetworks)
+  if ($ssid) { netsh.exe wlan connect name="$ssid" | Out-Null }
+  return $ssid
+}
+
 function Open-WifiPicker { try { Start-Process 'ms-availablenetworks:' } catch { Start-Process 'ms-settings:network-wifi' } }
+
+# The Wi-Fi radio is the Windows quick-settings Wi-Fi switch, separate from the card being enabled. While it is off
+# no network can be listed or joined. WinRT Windows.Devices.Radios, no admin needed. Its async calls deadlock on the
+# window's (WPF dispatcher) thread, so every call runs on a separate MTA runspace; $want = '' reads, 'On'/'Off' sets.
+$RadioCode = @'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = @([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Wait-WinRt($op, [Type]$type) { $t = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); [void]$t.Wait(10000); $t.Result }
+[void][Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType = WindowsRuntime]
+[void](Wait-WinRt ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus]))
+$radios = Wait-WinRt ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+$r = @($radios | Where-Object { "$($_.Kind)" -eq 'WiFi' })[0]
+if ($r -and $want) { [void](Wait-WinRt ($r.SetStateAsync($want)) ([Windows.Devices.Radios.RadioAccessStatus])) }
+if ($r) { "$($r.State)" } else { '' }
+'@
+
+function Invoke-Radio([string]$want) {
+  $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'MTA'; $rs.Open()
+  $ps = [powershell]::Create(); $ps.Runspace = $rs
+  try {
+    $rs.SessionStateProxy.SetVariable('want', $want); [void]$ps.AddScript($RadioCode)
+    $h = $ps.BeginInvoke()
+    # Radio access calls back into this process's message loop, so keep it pumping while waiting.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $h.IsCompleted -and $sw.ElapsedMilliseconds -lt 20000) {
+      $frame = New-Object Windows.Threading.DispatcherFrame
+      [void][Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,
+        [Windows.Threading.DispatcherOperationCallback] { param($f) $f.Continue = $false; $null }, $frame)
+      [Windows.Threading.Dispatcher]::PushFrame($frame)
+      Start-Sleep -Milliseconds 30
+    }
+    if (-not $h.IsCompleted) { return '' }
+    return "$(@($ps.EndInvoke($h))[-1])"
+  }
+  catch { return '' }
+  finally { $ps.Dispose(); $rs.Dispose() }
+}
+
+function Test-WifiRadioOff { return (Invoke-Radio '') -eq 'Off' }
+
+# Turns the radio on and waits until networks show up (they take a few seconds after the switch).
+function Set-WifiRadio([bool]$on) {
+  if (-not (Invoke-Radio $(if ($on) { 'On' } else { 'Off' }))) { return $false }
+  if ($on) { foreach ($i in 1..12) { Start-Sleep -Milliseconds 700; if ((Get-WifiNetworks).Visible.Count) { break } } }
+  return $true
+}
 
 function Test-Desired($s, [string]$want, $c) {
   if ($want -eq 'Static') {
@@ -278,8 +333,12 @@ function Invoke-Mode([string]$mode) {
     if ($ad.Status -ne 'Up' -and -not (Test-Desired (Get-IfState $ad) 'Static' $c)) {
       $wasDisabled = $ad.Status -eq 'Disabled'
       if ($wasDisabled) { Enable-NetAdapter -Name $ad.Name -Confirm:$false; $log.Add("เปิดการ์ด $($ad.Name)") }
-      # From the window the connect/picker is done by the window itself; from the command line do it here.
-      if (-not $ResultFile) {
+      # From the window the connect/choice is done by the window itself; from the command line do it here, and also
+      # after switching a card on (the window could not list networks while the radio was off).
+      $radioWasOff = $false
+      if (-not $ResultFile -and (Test-WifiRadioOff)) { $radioWasOff = Set-WifiRadio $true; if ($radioWasOff) { $log.Add('เปิด Wi-Fi') } }
+      if (-not $ResultFile -or $wasDisabled) {
+        if ($wasDisabled) { Start-Sleep -Seconds 4 }
         $ssid = Connect-PreferredWifi $c
         if ($ssid) { $log.Add("เชื่อมต่อ $ssid ที่บันทึกไว้") } else { Open-WifiPicker; $log.Add('เปิดรายการ Wi-Fi ให้เลือก') }
       }
@@ -296,6 +355,7 @@ function Invoke-Mode([string]$mode) {
         # (stop the connection attempt, switch the card off again if it was off). LAN was never touched.
         netsh.exe wlan disconnect interface="$($ad.Name)" | Out-Null
         if ($wasDisabled) { Disable-NetAdapter -Name $ad.Name -Confirm:$false }
+        if ($radioWasOff) { [void](Set-WifiRadio $false) }
         $back = $(if ($wasDisabled) { 'ปิดการ์ด Wi-Fi กลับเหมือนเดิม' } else { 'ตัด Wi-Fi กลับเหมือนเดิม' })
         if ($cancelled) { return @{ Ok = $false; Cancelled = $true; Log = @("ยกเลิกแล้ว ไม่ได้เปลี่ยนอะไร LAN ยังเหมือนเดิม ($back)") } }
         $log.Add("หมดเวลา $WaitSeconds วินาที ยังไม่ได้เลือก Wi-Fi จึงกลับเป็นแบบเดิม LAN ไม่ได้เปลี่ยน ($back)")
@@ -562,7 +622,7 @@ public static class IpSwitchDwm {
             <StackPanel>
               <TextBlock Text="&#xE701;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="22" Foreground="#FF0067C0"/>
               <TextBlock Text="Wi-Fi" FontSize="15" FontWeight="SemiBold" Margin="0,8,0,0"/>
-              <TextBlock Text="IP ไปอยู่ที่ Wi-Fi" Foreground="#FF5C5C5C" FontSize="12" TextWrapping="Wrap"/>
+              <TextBlock x:Name="WifiSub" Text="IP ไปอยู่ที่ Wi-Fi" Foreground="#FF5C5C5C" FontSize="12" TextWrapping="Wrap"/>
             </StackPanel>
             <Border x:Name="BadgeWifi" Style="{StaticResource Badge}"><TextBlock Text="ใช้อยู่" Foreground="White" FontSize="11"/></Border>
           </Grid>
@@ -630,7 +690,7 @@ public static class IpSwitchDwm {
           <Grid>
             <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition/></Grid.ColumnDefinitions>
             <Grid.RowDefinitions>
-              <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+              <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
             </Grid.RowDefinitions>
             <TextBlock Text="IP" VerticalAlignment="Center" Margin="0,0,0,6"/>
             <TextBox x:Name="FIp" Grid.Column="1"/>
@@ -648,7 +708,9 @@ public static class IpSwitchDwm {
             <ComboBox x:Name="FWifi" Grid.Row="6" Grid.Column="1"/>
             <TextBlock Grid.Row="7" Text="Wi-Fi ที่ใช้" VerticalAlignment="Center" Margin="0,0,0,6"/>
             <ComboBox x:Name="FSsid" Grid.Row="7" Grid.Column="1"/>
-            <DockPanel Grid.Row="8" Grid.ColumnSpan="2" Margin="0,4,0,0">
+            <TextBlock Grid.Row="8" Text="Wi-Fi อัตโนมัติ" VerticalAlignment="Center" Margin="0,0,0,6"/>
+            <TextBox x:Name="FAuto" Grid.Row="8" Grid.Column="1" ToolTip="ต่อ Wi-Fi ที่เคยใช้ซึ่งชื่อขึ้นต้นด้วยคำนี้ให้เอง เลือกตัวที่สัญญาณแรงที่สุด คั่นหลายคำด้วยจุลภาค เว้นว่างไว้ถ้าไม่ต้องการให้ต่อเอง"/>
+            <DockPanel Grid.Row="9" Grid.ColumnSpan="2" Margin="0,4,0,0">
               <Button x:Name="SaveBtn" DockPanel.Dock="Right" Style="{StaticResource Btn}" Background="#FF0067C0" Foreground="White" Content="บันทึก"/>
               <Button x:Name="ReadBtn" DockPanel.Dock="Right" Style="{StaticResource Btn}" Margin="0,0,8,0" Content="ใช้ค่าปัจจุบัน" ToolTip="อ่าน IP ที่เครื่องใช้อยู่ตอนนี้มาใส่ช่องด้านบน"/>
               <TextBlock x:Name="SaveMsg" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,10,0"/>
@@ -672,7 +734,7 @@ $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x
 $ui = @{}
 foreach ($n in 'Root', 'HeadIcon', 'Now', 'TileLan', 'TileWifi', 'TileDhcp', 'BadgeLan', 'BadgeWifi', 'BadgeDhcp',
   'LanDot', 'LanName', 'LanInfo', 'LanPill', 'LanConn', 'WifiDot', 'WifiName', 'WifiInfo', 'WifiPill', 'WifiConn', 'LogCard', 'LogBar', 'Log', 'Busy', 'CancelBtn', 'UndoBtn',
-  'Hint', 'SettingsBox', 'FSsid', 'ReadBtn', 'FIp', 'FMask', 'FGw', 'FDns1', 'FDns2', 'FLan', 'FWifi', 'SaveBtn', 'SaveMsg', 'RefreshBtn',
+  'Hint', 'SettingsBox', 'FSsid', 'FAuto', 'WifiSub', 'ReadBtn', 'FIp', 'FMask', 'FGw', 'FDns1', 'FDns2', 'FLan', 'FWifi', 'SaveBtn', 'SaveMsg', 'RefreshBtn',
   'UpdateCard', 'UpdateTitle', 'UpdateText', 'UpdateBtn', 'UpdateNotesBtn', 'AboutBtn') { $ui[$n] = $win.FindName($n) }
 $win.Title = "IP Switch $AppVersion"
 $tiles = @{ Lan = $ui.TileLan; Wifi = $ui.TileWifi; Dhcp = $ui.TileDhcp }
@@ -740,6 +802,24 @@ function Update-Status {
     elseif ($snap.Near) { "ตอนนี้: $($ModeLabel[$snap.Near]) แต่การ์ดอีกตัวมีค่าเก่าค้าง กด $($ModeLabel[$snap.Near]) อีกครั้งเพื่อล้าง" }
     else { 'ตอนนี้: ค่าไม่ตรงกับปุ่มไหน กดเลือกเพื่อจัดให้ถูก' })
   $ui.Hint.Text = $(if (Test-Admin) { '' } else { 'กดปุ่มแล้ว Windows จะขอสิทธิ์ admin   ' }) + 'Static ที่ Wi-Fi ใช้กับทุกเครือข่าย Wi-Fi ย้ายไปเครือข่ายอื่นให้กด อัตโนมัติ'
+  $ui.WifiSub.Text = Get-WifiTileText $c $snap.States['Wifi']
+}
+
+# What the Wi-Fi button will do, so nobody waits thinking it picks a network by itself. The scan is cached
+# for 20 s because the window refreshes every time it gets focus.
+function Get-WifiTileText($c, $s) {
+  if (-not $s) { return 'ไม่พบการ์ด Wi-Fi' }
+  if ($s.Up) { $now = Get-CurrentSsid; return $(if ($now) { "ใช้ $now ที่ต่ออยู่" } else { 'ใช้ Wi-Fi ที่ต่ออยู่' }) }
+  if ($s.Disabled) { return 'การ์ด Wi-Fi ปิดอยู่ กดแล้วเปิดให้' }
+  if (-not $script:scanAt -or ([DateTime]::Now - $script:scanAt).TotalSeconds -gt 20) {
+    $script:radioOff = Test-WifiRadioOff
+    $script:scan = $(if ($script:radioOff) { $null } else { Get-WifiNetworks })
+    $script:scanAt = [DateTime]::Now
+  }
+  if ($script:radioOff) { return 'Wi-Fi ปิดอยู่ กดแล้วเปิดและต่อให้' }
+  $pref = Find-PreferredWifi $c $script:scan
+  if ($pref) { return "ต่อ $pref ให้อัตโนมัติ" }
+  return 'ยังไม่ได้เลือก Wi-Fi กดแล้วเลือกเอง'
 }
 
 function Fill-Settings {
@@ -756,7 +836,7 @@ function Fill-Settings {
   [void]$ui.FSsid.Items.Add($script:LastSsidItem)
   foreach ($p in (Get-WifiNetworks).Saved) { [void]$ui.FSsid.Items.Add($p) }
   $ui.FSsid.SelectedItem = $(if ($c.WifiSsid -and $ui.FSsid.Items.Contains($c.WifiSsid)) { $c.WifiSsid } else { $script:LastSsidItem })
-  $ui.SettingsBox.IsExpanded = -not $c.Ip
+  $ui.FAuto.Text = $c.WifiAuto
   if (-not $c.Ip) {
     # First run: take the IP this PC uses now and save it straight away; settings stay open only if that fails.
     $cur = Get-CurrentIpSettings
@@ -808,12 +888,16 @@ $timer.Interval = [TimeSpan]::FromMilliseconds(300)
 $timer.Add_Tick({
   $j = $script:job
   $sec = [int]([DateTime]::Now - $j.Start).TotalSeconds
-  # Saved Wi-Fi did not come up in time (or none was saved): open the Windows Wi-Fi list once.
-  if ($j.PickerAt -and [DateTime]::Now -ge $j.PickerAt) {
-    $j.PickerAt = $null
+  # The network it tried did not connect in time: let the user pick another one (closing the list cancels).
+  if ($j.ChooserAt -and [DateTime]::Now -ge $j.ChooserAt) {
+    $j.ChooserAt = $null
     if ((Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up') {
-      Open-WifiPicker
-      $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`nเลือก Wi-Fi ในรายการที่เด้งขึ้น ไม่เลือกภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"
+      $timer.Stop()
+      $pick = Show-WifiChooser (Read-Config) 'เชื่อมต่อ Wi-Fi ที่เลือกไว้ไม่ได้ เลือกเครือข่ายอื่น หรือกดยกเลิกเพื่อกลับเป็นแบบเดิม'
+      $timer.Start()
+      if (-not $pick) { Request-Cancel; return }
+      $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`n$(Use-WifiChoice $pick)`nไม่ติดภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"; $j.Shown = -1
+      if ($pick.Saved) { $j.ChooserAt = [DateTime]::Now.AddSeconds(20) }
     }
   }
   # No time limit: switching back from Wi-Fi took 3.5 minutes once and still finished correctly.
@@ -832,6 +916,11 @@ $timer.Add_Tick({
   $r = $null
   try { $r = [IO.File]::ReadAllText($j.File, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
   Remove-Item $j.File, "$($j.File).cancel" -ErrorAction SilentlyContinue
+  # Wi-Fi was off before the press and the switch did not happen: switch the radio off again.
+  if ($j.RadioWasOff -and -not ($r -and $r.Ok)) {
+    [void](Set-WifiRadio $false)
+    if ($r) { $r.Log = @($r.Log) + 'ปิด Wi-Fi กลับเหมือนเดิม' }
+  }
   if ($r) {
     Set-Log $(if ($r.Ok) { '#FF0F7B0F' } elseif ($r.Cancelled) { '#FF8A8A8A' } else { '#FFC42B1C' }) ($r.Log -join "`n")
     # One click back to the mode it was in before this switch.
@@ -860,23 +949,146 @@ function Set-Log($color, [string]$text, [switch]$Busy) {
   $ui.LogCard.Visibility = 'Visible'
 }
 
+# In-window Wi-Fi list, shown before anything changes when no preferred network can be joined. Returns
+# @{ Ssid; Saved } or $null (closed / cancelled). Nothing is switched while it is open.
+function Show-WifiChooser($c, [string]$why) {
+  [xml]$cx = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="เลือก Wi-Fi" Width="420" Height="460" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#FFF7F7F7"
+        FontFamily="Segoe UI Variable Text, Segoe UI, Leelawadee UI" FontSize="13" Foreground="#FF1B1B1B">
+  <Window.Resources>
+    <Style TargetType="Button">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Background" Value="#FFFFFFFF"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" CornerRadius="4" Background="{TemplateBinding Background}" BorderBrush="#1F000000" BorderThickness="1" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.85"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Opacity" Value="0.5"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <DockPanel Margin="20,16,20,16">
+    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+      <TextBlock Text="เลือก Wi-Fi ที่จะใช้" FontSize="18" FontWeight="SemiBold"/>
+      <TextBlock x:Name="Why" Foreground="#FF5C5C5C" TextWrapping="Wrap" Margin="0,4,0,0"/>
+    </StackPanel>
+    <DockPanel DockPanel.Dock="Bottom" Margin="0,12,0,0">
+      <Button x:Name="OkBtn" DockPanel.Dock="Right" Content="เชื่อมต่อ" Padding="18,5" Background="#FF0067C0" Foreground="White" IsDefault="True"/>
+      <Button x:Name="NoBtn" DockPanel.Dock="Right" Content="ยกเลิก" Padding="14,5" Margin="0,0,8,0" IsCancel="True"/>
+      <Button x:Name="ScanBtn" DockPanel.Dock="Left" Content="รีเฟรช" Padding="14,5" HorizontalAlignment="Left"/>
+    </DockPanel>
+    <ListBox x:Name="Nets" BorderBrush="#14000000" Background="#FFFFFFFF" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+  </DockPanel>
+</Window>
+'@
+  $cw = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $cx))
+  $cw.Owner = $win
+  if ($win.Icon) { $cw.Icon = $win.Icon }
+  $cw.FindName('Why').Text = $why
+  $nets = $cw.FindName('Nets'); $ok = $cw.FindName('OkBtn')
+  $script:wifiPick = $null
+  $fill = {
+    $nets.Items.Clear()
+    $w = Get-WifiNetworks
+    $prefixes = @("$($c.WifiAuto)" -split '\s*,\s*' | Where-Object { $_ })
+    foreach ($s in @($w.Visible.Keys | Sort-Object { $w.Visible[$_] } -Descending)) {
+      $saved = $w.Saved -contains $s
+      $row = New-Object Windows.Controls.DockPanel
+      $right = New-Object Windows.Controls.TextBlock
+      $right.Text = $(if ($saved) { "เคยใช้   $($w.Visible[$s])%" } else { "$($w.Visible[$s])%" })
+      $right.Foreground = & $brush '#FF5C5C5C'; $right.Margin = '12,0,0,0'
+      [Windows.Controls.DockPanel]::SetDock($right, 'Right')
+      $name = New-Object Windows.Controls.TextBlock
+      $name.Text = $(if ($s.Trim()) { $s } else { '(ไม่มีชื่อ)' }); $name.TextTrimming = 'CharacterEllipsis'
+      if ($saved) { $name.FontWeight = 'SemiBold' }
+      [void]$row.Children.Add($right); [void]$row.Children.Add($name)
+      $item = New-Object Windows.Controls.ListBoxItem
+      $item.Content = $row; $item.Padding = '8,7'; $item.Tag = @{ Ssid = $s; Saved = $saved }
+      [void]$nets.Items.Add($item)
+    }
+    if (-not $nets.Items.Count) {
+      $none = New-Object Windows.Controls.ListBoxItem
+      $none.Content = 'ไม่เจอ Wi-Fi ในระยะ กดรีเฟรช'; $none.IsEnabled = $false; $none.Padding = '8,7'
+      [void]$nets.Items.Add($none)
+    }
+    # preselect a saved network that matches the auto-connect names, else the strongest saved, else the first
+    $pre = @($nets.Items | Where-Object { $_.Tag -and $_.Tag.Saved -and ($t = $_.Tag.Ssid) -and @($prefixes | Where-Object { $t.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count })[0]
+    if (-not $pre) { $pre = @($nets.Items | Where-Object { $_.Tag -and $_.Tag.Saved })[0] }
+    if (-not $pre) { $pre = @($nets.Items | Where-Object { $_.Tag })[0] }
+    $nets.SelectedItem = $pre
+  }
+  $accept = { $sel = $nets.SelectedItem; if ($sel -and $sel.Tag) { $script:wifiPick = $sel.Tag; $cw.Close() } }
+  $ok.Add_Click($accept)
+  $nets.Add_MouseDoubleClick($accept)
+  $nets.Add_SelectionChanged({ $ok.IsEnabled = [bool]($nets.SelectedItem -and $nets.SelectedItem.Tag) })
+  $cw.FindName('ScanBtn').Add_Click($fill)
+  $cw.FindName('NoBtn').Add_Click({ $cw.Close() })
+  & $fill
+  [void]$cw.ShowDialog()
+  return $script:wifiPick
+}
+
+# Join what the user picked: a saved network connects by itself, a new one needs its password in Windows' own list.
+function Use-WifiChoice($pick) {
+  if ($pick.Saved) { netsh.exe wlan connect name="$($pick.Ssid)" | Out-Null; return "กำลังเชื่อมต่อ $($pick.Ssid)" }
+  Open-WifiPicker
+  return "ใส่รหัสของ $($pick.Ssid) ในรายการ Wi-Fi ของ Windows ที่เด้งขึ้น"
+}
+
+function Request-Cancel {
+  $j = $script:job
+  if (-not $j -or $j.CancelAsked) { return }
+  $j.CancelAsked = $true; $j.ChooserAt = $null
+  try { [IO.File]::WriteAllText("$($j.File).cancel", '') } catch {}
+  $ui.CancelBtn.Visibility = 'Collapsed'
+  $j.Text = 'กำลังยกเลิก และคืน Wi-Fi เป็นแบบเดิม ...'; $j.Shown = -1
+}
+
 function Start-Switch([string]$mode) {
   if ($script:job) { return }
   if ($Modes[$mode].Values -contains 'Static' -and @(Test-Config (Read-Config)).Count) {
     $ui.SettingsBox.IsExpanded = $true; $ui.SaveMsg.Foreground = & $brush '#FFC42B1C'; $ui.SaveMsg.Text = 'ใส่ IP แล้วกดบันทึกก่อน'; return
   }
-  # Wi-Fi not connected: start connecting before the UAC prompt (no admin needed), so it is up by the time
-  # the switch runs. A saved network connects by itself; otherwise the Windows Wi-Fi list opens.
+  # Wi-Fi not connected: get it connecting before the UAC prompt (no admin needed), so it is up by the time the
+  # switch runs. Radio off -> switch it on. A preferred saved network connects by itself; if there is none the user
+  # picks one first, and nothing starts until they do.
   $c = Read-Config
   $before = Get-Snapshot $c
   $prev = $(if ($before.Current) { $before.Current } else { $before.Near })
-  $wait = ''; $pickerAt = $null; $wifiIndex = 0
+  $wait = ''; $chooserAt = $null; $wifiIndex = 0; $radioWasOff = $false
   $wifi = (Resolve-Adapters $c)['Wifi']
-  if ($mode -eq 'Wifi' -and $wifi -and $wifi.Status -ne 'Up') {
+  if ($mode -eq 'Wifi' -and $wifi -and $wifi.Status -ne 'Up' -and $wifi.Status -ne 'Disabled') {
     $wifiIndex = $wifi.ifIndex
+    if (Test-WifiRadioOff) {
+      Set-Log '#FF0067C0' 'กำลังเปิด Wi-Fi ...' -Busy
+      $win.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+      $radioWasOff = Set-WifiRadio $true
+    }
     $ssid = Connect-PreferredWifi $c
-    if ($ssid) { $wait = "`nกำลังเชื่อมต่อ $ssid (บันทึกไว้แล้ว)"; $pickerAt = [DateTime]::Now.AddSeconds(25) }
-    else { Open-WifiPicker; $wait = "`nเลือก Wi-Fi ในรายการที่เด้งขึ้น ไม่เลือกภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)" }
+    if ($ssid) { $wait = "`nกำลังเชื่อมต่อ $ssid ให้อัตโนมัติ"; $chooserAt = [DateTime]::Now.AddSeconds(20) }
+    else {
+      $prefix = "$($c.WifiAuto)".Trim()
+      $why = $(if ($prefix) { "ไม่เจอ Wi-Fi ที่ชื่อขึ้นต้นด้วย $prefix ที่เคยใช้ เลือกเครือข่ายที่จะใช้ IP $($c.Ip)" } else { "เลือกเครือข่ายที่จะใช้ IP $($c.Ip)" })
+      $pick = Show-WifiChooser $c $why
+      if (-not $pick) {
+        if ($radioWasOff) { [void](Set-WifiRadio $false) }
+        Set-Log '#FF8A8A8A' 'ยังไม่ได้เลือก Wi-Fi จึงไม่ได้เปลี่ยนอะไร'
+        return
+      }
+      $wait = "`n" + (Use-WifiChoice $pick)
+      if ($pick.Saved) { $chooserAt = [DateTime]::Now.AddSeconds(20) }
+    }
+    $wait += "`nไม่ติดภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"
   }
   $file = [IO.Path]::GetTempFileName()
   $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Apply $mode -ResultFile `"$file`"$SelfArgs"
@@ -885,12 +1097,13 @@ function Start-Switch([string]$mode) {
     else { $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -WindowStyle Hidden -PassThru }
   } catch {
     Remove-Item $file -ErrorAction SilentlyContinue
+    if ($radioWasOff) { [void](Set-WifiRadio $false) }
     Set-Log '#FFC42B1C' 'ไม่ได้รับสิทธิ์ admin จึงยังไม่ได้เปลี่ยนอะไร'; return
   }
   foreach ($t in $tiles.Values) { $t.IsEnabled = $false }
   $text = "กำลังเปลี่ยนเป็น $($ModeLabel[$mode]) ...$wait"
   Set-Log '#FF0067C0' $text -Busy
-  $script:job = @{ Proc = $p; File = $file; Start = [DateTime]::Now; Text = $text; Shown = -1; PickerAt = $pickerAt; WifiIndex = $wifiIndex
+  $script:job = @{ Proc = $p; File = $file; Start = [DateTime]::Now; Text = $text; Shown = -1; ChooserAt = $chooserAt; WifiIndex = $wifiIndex; RadioWasOff = $radioWasOff
                    Mode = $mode; Prev = $prev; CancelAsked = $false }
   $timer.Start()
 }
@@ -898,14 +1111,7 @@ function Start-Switch([string]$mode) {
 $ui.TileLan.Add_Click({ Start-Switch 'Lan' })
 $ui.TileWifi.Add_Click({ Start-Switch 'Wifi' })
 $ui.TileDhcp.Add_Click({ Start-Switch 'Dhcp' })
-$ui.CancelBtn.Add_Click({
-  $j = $script:job
-  if (-not $j -or $j.CancelAsked) { return }
-  $j.CancelAsked = $true; $j.PickerAt = $null
-  try { [IO.File]::WriteAllText("$($j.File).cancel", '') } catch {}
-  $ui.CancelBtn.Visibility = 'Collapsed'
-  $j.Text = 'กำลังยกเลิก และคืน Wi-Fi เป็นแบบเดิม ...'; $j.Shown = -1
-})
+$ui.CancelBtn.Add_Click({ Request-Cancel })
 $ui.UndoBtn.Add_Click({ if ($script:undoMode) { Start-Switch $script:undoMode } })
 $ui.RefreshBtn.Add_Click({ Update-Status })
 

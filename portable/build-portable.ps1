@@ -4,6 +4,14 @@
 $ErrorActionPreference = 'Stop'
 $app = Split-Path $PSScriptRoot
 $ver = (Get-Content (Join-Path $app 'VERSION') -Raw).Trim()
+# A window whose XAML does not parse never opens (the app just hangs hidden), so refuse to build one.
+$errs = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $app 'IpSwitch.ps1'), [ref]$null, [ref]$errs)
+if ($errs.Count) { throw "IpSwitch.ps1 does not parse: $($errs[0].Message) (line $($errs[0].Extent.StartLineNumber))" }
+foreach ($h in $ast.FindAll({ $args[0] -is [Management.Automation.Language.StringConstantExpressionAst] -and $args[0].Value -match '^\s*<Window' }, $true)) {
+  try { [void][xml]$h.Value } catch { throw "XAML at line $($h.Extent.StartLineNumber) is broken: $($_.Exception.Message)" }
+}
+
 $files = 'IpSwitch.ps1', 'README.md', 'ip-switch.ico', 'VERSION'
 $stage = Join-Path $env:TEMP 'ip-switch-portable'
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
