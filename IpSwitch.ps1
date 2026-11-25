@@ -167,26 +167,87 @@ function Get-CurrentSsid {
   return ''
 }
 
+# Is this network one of the WifiAuto names (name starts with a prefix, RAMA-BACK by default)?
+function Test-AutoSsid($c, [string]$ssid) {
+  foreach ($p in @("$($c.WifiAuto)" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+    if ($ssid.Trim().StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  }
+  return $false
+}
+
+function Test-AutoInRange($c, $w) { return [bool]@($w.Visible.Keys | Where-Object { Test-AutoSsid $c $_ }).Count }
+
+# Asks Windows for a fresh scan. While connected Windows lists only what it saw last, often just the current network.
+function Start-WifiScan($ad) {
+  try {
+    if (-not ('IpSwitchWlan' -as [type])) {
+      Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class IpSwitchWlan {
+  [DllImport("wlanapi.dll")] static extern int WlanOpenHandle(uint v, IntPtr r, out uint neg, out IntPtr h);
+  [DllImport("wlanapi.dll")] static extern int WlanScan(IntPtr h, ref Guid g, IntPtr ssid, IntPtr ie, IntPtr r);
+  [DllImport("wlanapi.dll")] static extern int WlanCloseHandle(IntPtr h, IntPtr r);
+  public static int Scan(Guid g) {
+    uint neg; IntPtr h; int rc = WlanOpenHandle(2, IntPtr.Zero, out neg, out h); if (rc != 0) return rc;
+    try { return WlanScan(h, ref g, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); } finally { WlanCloseHandle(h, IntPtr.Zero); }
+  }
+}
+"@
+    }
+    return [IpSwitchWlan]::Scan([Guid]$ad.InterfaceGuid) -eq 0
+  } catch { return $false }
+}
+
+# Networks in range, scanning again (up to 4 s) when no WifiAuto network (or, with no WifiAuto, the one chosen in
+# settings) is listed yet.
+function Get-FreshWifiNetworks($c, $ad) {
+  $found = { param($w) (Test-AutoInRange $c $w) -or (-not "$($c.WifiAuto)".Trim() -and (-not $c.WifiSsid -or $w.Visible.ContainsKey($c.WifiSsid))) }
+  $w = Get-WifiNetworks
+  if ((& $found $w) -or -not (Start-WifiScan $ad)) { return $w }
+  foreach ($n in 1..8) { Start-Sleep -Milliseconds 500; $w = Get-WifiNetworks; if (& $found $w) { break } }
+  return $w
+}
+
 # Which saved network in range to connect, never just any saved one (a phone hotspot in range would otherwise get
-# the static IP): the one chosen in settings, else the strongest whose name starts with a WifiAuto prefix,
-# else the last one a Wi-Fi switch worked on. '' = ask the user.
+# the static IP). A WifiAuto network in range always wins: the one chosen in settings if it is one of them, else the
+# strongest saved one; if none of them was ever joined, '' = ask, so the user signs in to it once. Only with no
+# WifiAuto network in range: the one chosen in settings, else the last one a Wi-Fi switch worked on, else '' = ask.
 function Find-PreferredWifi($c, $w) {
   $usable = { param($s) $s -and $w.Saved -contains $s -and $w.Visible.ContainsKey($s) }
-  if (& $usable $c.WifiSsid) { return $c.WifiSsid }
-  $prefixes = @("$($c.WifiAuto)" -split '\s*,\s*' | Where-Object { $_ })
-  $hit = @($w.Visible.Keys | Where-Object {
-      $s = $_; (& $usable $s) -and @($prefixes | Where-Object { $s.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count
-    } | Sort-Object { $w.Visible[$_] } -Descending)[0]
-  if ($hit) { return $hit }
+  $auto = @($w.Visible.Keys | Where-Object { Test-AutoSsid $c $_ })
+  if ((& $usable $c.WifiSsid) -and (-not $auto.Count -or (Test-AutoSsid $c $c.WifiSsid))) { return $c.WifiSsid }
+  if ($auto.Count) { return "$(@($auto | Where-Object { & $usable $_ } | Sort-Object { $w.Visible[$_] } -Descending)[0])" }
   if (& $usable $c.LastWifiSsid) { return $c.LastWifiSsid }
   return ''
 }
 
-function Connect-PreferredWifi($c) {
-  $ssid = Find-PreferredWifi $c (Get-WifiNetworks)
-  if ($ssid) { netsh.exe wlan connect name="$ssid" | Out-Null }
-  return $ssid
+# Connected, but to another network while a WifiAuto one is in range, or with none in range the one chosen in
+# settings: the Wi-Fi switch has to move over first. With nothing chosen the current network stays.
+function Test-WifiMove($c, $w, [string]$now) {
+  if (-not $now -or (Test-AutoSsid $c $now)) { return $false }
+  if (Test-AutoInRange $c $w) { return $true }
+  return [bool]($c.WifiSsid -and $now -ne $c.WifiSsid -and $w.Saved -contains $c.WifiSsid -and $w.Visible.ContainsKey($c.WifiSsid))
 }
+
+# Has the card reached the network the switch is meant for? $plan: To = that network ('' = any), Auto = any WifiAuto
+# network, Back = the network it is moving away from. Another WifiAuto network than To is just as good.
+function Test-WifiReady($c, $plan, [string]$now) {
+  if ($plan.To) { return $now -eq $plan.To -or ((Test-AutoSsid $c $plan.To) -and (Test-AutoSsid $c $now)) }
+  if ($plan.Auto) { return Test-AutoSsid $c $now }
+  return -not $plan.Back -or ($now -and $now -ne $plan.Back)
+}
+
+# The window hands its Wi-Fi choice to the switch process in <result file>.wifi; it can change while that one waits.
+function Read-WifiPlan([string]$file, $old) {
+  try { $j = [IO.File]::ReadAllText("$file.wifi", [Text.Encoding]::UTF8) | ConvertFrom-Json; return @{ To = "$($j.To)"; Auto = [bool]$j.Auto; Back = "$($j.Back)" } }
+  catch { return $old }
+}
+
+function Save-WifiPlan([string]$file, $plan) {
+  [IO.File]::WriteAllText("$file.wifi", ($plan | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+}
+
+function Connect-Wifi([string]$ssid) { if ($ssid) { netsh.exe wlan connect name="$ssid" | Out-Null } }
 
 function Open-WifiPicker { try { Start-Process 'ms-availablenetworks:' } catch { Start-Process 'ms-settings:network-wifi' } }
 
@@ -330,7 +391,16 @@ function Invoke-Mode([string]$mode) {
   # and changes nothing), so wait for the connection first. A wired card takes a static IP unplugged too.
   if ($target -eq 'Wifi' -and -not $DryRun) {
     $ad = $ads['Wifi']
-    if ($ad.Status -ne 'Up' -and -not (Test-Desired (Get-IfState $ad) 'Static' $c)) {
+    $plan = @{ To = ''; Auto = $false; Back = '' }
+    if ($ResultFile) { $plan = Read-WifiPlan $ResultFile $plan }
+    elseif ($ad.Status -eq 'Up') {
+      $now = Get-CurrentSsid
+      if ($now -and -not (Test-AutoSsid $c $now) -and (Test-WifiMove $c (Get-FreshWifiNetworks $c $ad) $now)) { $plan.Back = $now }
+    }
+    # Up is not enough: Windows may have joined another saved network by itself meanwhile.
+    $wait = $(if ($ad.Status -eq 'Up') { -not (Test-WifiReady $c $plan $(if ($plan.To -or $plan.Back) { Get-CurrentSsid })) }
+      else { -not (Test-Desired (Get-IfState $ad) 'Static' $c) })
+    if ($wait) {
       $wasDisabled = $ad.Status -eq 'Disabled'
       if ($wasDisabled) { Enable-NetAdapter -Name $ad.Name -Confirm:$false; $log.Add("เปิดการ์ด $($ad.Name)") }
       # From the window the connect/choice is done by the window itself; from the command line do it here, and also
@@ -339,26 +409,32 @@ function Invoke-Mode([string]$mode) {
       if (-not $ResultFile -and (Test-WifiRadioOff)) { $radioWasOff = Set-WifiRadio $true; if ($radioWasOff) { $log.Add('เปิด Wi-Fi') } }
       if (-not $ResultFile -or $wasDisabled) {
         if ($wasDisabled) { Start-Sleep -Seconds 4 }
-        $ssid = Connect-PreferredWifi $c
-        if ($ssid) { $log.Add("เชื่อมต่อ $ssid ที่บันทึกไว้") } else { Open-WifiPicker; $log.Add('เปิดรายการ Wi-Fi ให้เลือก') }
+        $w = Get-FreshWifiNetworks $c $ad
+        $plan.To = Find-PreferredWifi $c $w
+        $plan.Auto = -not $plan.To -and (Test-AutoInRange $c $w)
+        Connect-Wifi $plan.To
+        if ($plan.To) { $log.Add("เชื่อมต่อ $($plan.To) ที่บันทึกไว้") }
+        else { Open-WifiPicker; $log.Add($(if ($plan.Auto) { "เปิดรายการ Wi-Fi ให้เข้าสู่ระบบ $($c.WifiAuto) ครั้งแรก" } else { 'เปิดรายการ Wi-Fi ให้เลือก' })) }
       }
       # The window asks to cancel by creating <result file>.cancel (it cannot stop this process when it runs as admin).
       $cancelFile = $(if ($ResultFile) { "$ResultFile.cancel" })
-      $cancelled = $false
-      foreach ($w in 1..$WaitSeconds) {
+      $cancelled = $false; $ready = $false
+      foreach ($n in 1..$WaitSeconds) {
         Start-Sleep -Seconds 1
         if ($cancelFile -and (Test-Path -LiteralPath $cancelFile)) { $cancelled = $true; break }
-        $ad = Get-NetAdapter -InterfaceIndex $ad.ifIndex; if ($ad.Status -eq 'Up') { break }
+        if ($ResultFile -and -not $wasDisabled) { $plan = Read-WifiPlan $ResultFile $plan }
+        $ad = Get-NetAdapter -InterfaceIndex $ad.ifIndex
+        if ($ad.Status -eq 'Up' -and (Test-WifiReady $c $plan (Get-CurrentSsid))) { $ready = $true; break }
       }
-      if ($cancelled -or $ad.Status -ne 'Up') {
+      if (-not $ready) {
         # Cancelled or nobody picked a network in time: put Wi-Fi back as it was before the press
         # (stop the connection attempt, switch the card off again if it was off). LAN was never touched.
-        netsh.exe wlan disconnect interface="$($ad.Name)" | Out-Null
+        if ($plan.Back) { Connect-Wifi $plan.Back } else { netsh.exe wlan disconnect interface="$($ad.Name)" | Out-Null }
         if ($wasDisabled) { Disable-NetAdapter -Name $ad.Name -Confirm:$false }
         if ($radioWasOff) { [void](Set-WifiRadio $false) }
-        $back = $(if ($wasDisabled) { 'ปิดการ์ด Wi-Fi กลับเหมือนเดิม' } else { 'ตัด Wi-Fi กลับเหมือนเดิม' })
+        $back = $(if ($plan.Back) { "ต่อ $($plan.Back) กลับเหมือนเดิม" } elseif ($wasDisabled) { 'ปิดการ์ด Wi-Fi กลับเหมือนเดิม' } else { 'ตัด Wi-Fi กลับเหมือนเดิม' })
         if ($cancelled) { return @{ Ok = $false; Cancelled = $true; Log = @("ยกเลิกแล้ว ไม่ได้เปลี่ยนอะไร LAN ยังเหมือนเดิม ($back)") } }
-        $log.Add("หมดเวลา $WaitSeconds วินาที ยังไม่ได้เลือก Wi-Fi จึงกลับเป็นแบบเดิม LAN ไม่ได้เปลี่ยน ($back)")
+        $log.Add("หมดเวลา $WaitSeconds วินาที ยังไม่ได้ต่อ Wi-Fi ที่ต้องการ จึงกลับเป็นแบบเดิม LAN ไม่ได้เปลี่ยน ($back)")
         $since = (Get-Date).AddMinutes(-5)
         $fail = @(11006, 8002 | ForEach-Object { Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = $_; StartTime = $since } -MaxEvents 1 -ErrorAction SilentlyContinue })[0]
         if ($fail) {
@@ -809,15 +885,22 @@ function Update-Status {
 # for 20 s because the window refreshes every time it gets focus.
 function Get-WifiTileText($c, $s) {
   if (-not $s) { return 'ไม่พบการ์ด Wi-Fi' }
-  if ($s.Up) { $now = Get-CurrentSsid; return $(if ($now) { "ใช้ $now ที่ต่ออยู่" } else { 'ใช้ Wi-Fi ที่ต่ออยู่' }) }
+  $now = $(if ($s.Up) { Get-CurrentSsid } else { '' })
+  if ($s.Up -and -not $now) { return 'ใช้ Wi-Fi ที่ต่ออยู่' }
+  if ($now -and (Test-AutoSsid $c $now)) { return "ใช้ $now ที่ต่ออยู่" }
   if ($s.Disabled) { return 'การ์ด Wi-Fi ปิดอยู่ กดแล้วเปิดให้' }
   if (-not $script:scanAt -or ([DateTime]::Now - $script:scanAt).TotalSeconds -gt 20) {
-    $script:radioOff = Test-WifiRadioOff
+    $script:radioOff = -not $s.Up -and (Test-WifiRadioOff)
     $script:scan = $(if ($script:radioOff) { $null } else { Get-WifiNetworks })
     $script:scanAt = [DateTime]::Now
+    # no waiting here: the next refresh of the window lists what this finds
+    if (-not $script:radioOff) { $ad = (Resolve-Adapters $c)['Wifi']; if ($ad) { [void](Start-WifiScan $ad) } }
   }
-  if ($script:radioOff) { return 'Wi-Fi ปิดอยู่ กดแล้วเปิดและต่อให้' }
+  if ($script:radioOff -and -not $s.Up) { return 'Wi-Fi ปิดอยู่ กดแล้วเปิดและต่อให้' }
+  if ($now -and -not (Test-WifiMove $c $script:scan $now)) { return "ใช้ $now ที่ต่ออยู่" }
   $pref = Find-PreferredWifi $c $script:scan
+  if ($now -and $pref) { return "ย้ายจาก $now ไป $pref" }
+  if (-not $pref -and (Test-AutoInRange $c $script:scan)) { return "เจอ $($c.WifiAuto) กดแล้วเข้าสู่ระบบครั้งแรก" }
   if ($pref) { return "ต่อ $pref ให้อัตโนมัติ" }
   return 'ยังไม่ได้เลือก Wi-Fi กดแล้วเลือกเอง'
 }
@@ -873,6 +956,7 @@ $ui.SaveBtn.Add_Click({
     WifiAdapter = $(if ($ui.FWifi.SelectedItem -and $ui.FWifi.SelectedItem -ne $auto) { $ui.FWifi.SelectedItem } else { '' })
     WifiSsid = $(if ($ui.FSsid.SelectedItem -and $ui.FSsid.SelectedItem -ne $script:LastSsidItem) { $ui.FSsid.SelectedItem } else { '' })
     LastWifiSsid = (Read-Config).LastWifiSsid
+    WifiAuto = $ui.FAuto.Text.Trim()
   }
   $err = @(Test-Config $c)
   if ($err.Count) { $ui.SaveMsg.Foreground = & $brush '#FFC42B1C'; $ui.SaveMsg.Text = $err -join ', '; return }
@@ -891,11 +975,13 @@ $timer.Add_Tick({
   # The network it tried did not connect in time: let the user pick another one (closing the list cancels).
   if ($j.ChooserAt -and [DateTime]::Now -ge $j.ChooserAt) {
     $j.ChooserAt = $null
-    if ((Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up') {
+    if (Test-WifiWaiting $j) {
       $timer.Stop()
       $pick = Show-WifiChooser (Read-Config) 'เชื่อมต่อ Wi-Fi ที่เลือกไว้ไม่ได้ เลือกเครือข่ายอื่น หรือกดยกเลิกเพื่อกลับเป็นแบบเดิม' -NoPreselect
       $timer.Start()
       if (-not $pick) { Request-Cancel; return }
+      $j.Plan = @{ To = $pick.Ssid; Auto = $false; Back = $j.Plan.Back }
+      Save-WifiPlan $j.File $j.Plan
       $j.Text = "กำลังเปลี่ยนเป็น Wi-Fi ...`n$(Use-WifiChoice $pick)`nไม่ติดภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"; $j.Shown = -1
       if ($pick.Saved) { $j.ChooserAt = [DateTime]::Now.AddSeconds(20) }
     }
@@ -907,7 +993,7 @@ $timer.Add_Tick({
     if ($sec -ne $j.Shown) {
       $j.Shown = $sec; $ui.Log.Text = "$($j.Text)`nผ่านไป $sec วินาที"
       # Cancel is offered only while it still waits for Wi-Fi; once Wi-Fi is up the switch itself starts.
-      $waiting = $j.WifiIndex -and -not $j.CancelAsked -and (Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -ne 'Up'
+      $waiting = -not $j.CancelAsked -and (Test-WifiWaiting $j)
       $ui.CancelBtn.Visibility = $(if ($waiting) { 'Visible' } else { 'Collapsed' })
     }
     return
@@ -915,7 +1001,7 @@ $timer.Add_Tick({
   $timer.Stop()
   $r = $null
   try { $r = [IO.File]::ReadAllText($j.File, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
-  Remove-Item $j.File, "$($j.File).cancel" -ErrorAction SilentlyContinue
+  Remove-Item $j.File, "$($j.File).cancel", "$($j.File).wifi" -ErrorAction SilentlyContinue
   # Wi-Fi was off before the press and the switch did not happen: switch the radio off again.
   if ($j.RadioWasOff -and -not ($r -and $r.Ok)) {
     [void](Set-WifiRadio $false)
@@ -1000,8 +1086,7 @@ function Show-WifiChooser($c, [string]$why, [switch]$NoPreselect) {
   $fill = {
     $nets.Items.Clear()
     $w = Get-WifiNetworks
-    $prefixes = @("$($c.WifiAuto)" -split '\s*,\s*' | Where-Object { $_ })
-    $isMatch = { param($s) [bool]@($prefixes | Where-Object { $s.Trim().StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count }
+    $isMatch = { param($s) Test-AutoSsid $c $s }
     # networks named like the auto-connect names first (also never-joined ones: a new PC signs in to them once),
     # then the rest, each group strongest first
     foreach ($s in @($w.Visible.Keys | Sort-Object @{ Expression = { -not (& $isMatch $_) } }, @{ Expression = { $w.Visible[$_] }; Descending = $true })) {
@@ -1051,6 +1136,14 @@ function Use-WifiChoice($pick) {
   return "ใส่รหัสของ $($pick.Ssid) ในรายการ Wi-Fi ของ Windows ที่เด้งขึ้น"
 }
 
+# Still waiting for the Wi-Fi network this switch is meant for; once reached it never asks again.
+function Test-WifiWaiting($j) {
+  if (-not $j.WifiIndex -or $j.WifiDone) { return $false }
+  $j.WifiDone = (Get-NetAdapter -InterfaceIndex $j.WifiIndex -ErrorAction SilentlyContinue).Status -eq 'Up' -and
+    [bool](Test-WifiReady (Read-Config) $j.Plan (Get-CurrentSsid))
+  return -not $j.WifiDone
+}
+
 function Request-Cancel {
   $j = $script:job
   if (-not $j -or $j.CancelAsked) { return }
@@ -1067,42 +1160,64 @@ function Start-Switch([string]$mode) {
   }
   # Wi-Fi not connected: get it connecting before the UAC prompt (no admin needed), so it is up by the time the
   # switch runs. Radio off -> switch it on. A preferred saved network connects by itself; if there is none the user
-  # picks one first, and nothing starts until they do.
+  # picks one first, and nothing starts until they do. Connected to another network while a WifiAuto one is in range:
+  # the same, and a cancelled or failed move goes back to that network.
   $c = Read-Config
   $before = Get-Snapshot $c
   $prev = $(if ($before.Current) { $before.Current } else { $before.Near })
   $wait = ''; $chooserAt = $null; $wifiIndex = 0; $radioWasOff = $false
   $wifi = (Resolve-Adapters $c)['Wifi']
-  if ($mode -eq 'Wifi' -and $wifi -and $wifi.Status -ne 'Up' -and $wifi.Status -ne 'Disabled') {
+  $plan = $null; $nets = $null; $from = ''
+  if ($mode -eq 'Wifi' -and $wifi -and $wifi.Status -eq 'Up') {
+    $now = Get-CurrentSsid
+    if ($now -and -not (Test-AutoSsid $c $now)) {
+      Set-Log '#FF0067C0' 'กำลังหา Wi-Fi ...' -Busy
+      $win.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+      $nets = Get-FreshWifiNetworks $c $wifi
+      if (Test-WifiMove $c $nets $now) { $from = $now }
+    }
+  }
+  if ($mode -eq 'Wifi' -and $wifi -and ($from -or $wifi.Status -notin 'Up', 'Disabled')) {
     $wifiIndex = $wifi.ifIndex
-    if (Test-WifiRadioOff) {
+    if (-not $from -and (Test-WifiRadioOff)) {
       Set-Log '#FF0067C0' 'กำลังเปิด Wi-Fi ...' -Busy
       $win.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
       $radioWasOff = Set-WifiRadio $true
     }
-    $ssid = Connect-PreferredWifi $c
+    if (-not $nets) {
+      Set-Log '#FF0067C0' 'กำลังหา Wi-Fi ...' -Busy
+      $win.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+      $nets = Get-FreshWifiNetworks $c $wifi
+    }
+    $ssid = Find-PreferredWifi $c $nets
+    Connect-Wifi $ssid
+    $plan = @{ To = $ssid; Auto = $false; Back = $from }
     if ($ssid) { $wait = "`nกำลังเชื่อมต่อ $ssid ให้อัตโนมัติ"; $chooserAt = [DateTime]::Now.AddSeconds(20) }
     else {
       $prefix = "$($c.WifiAuto)".Trim()
-      $why = $(if ($prefix) { "ไม่เจอ Wi-Fi ที่ชื่อขึ้นต้นด้วย $prefix ที่เคยใช้ เลือกเครือข่ายที่จะใช้ IP $($c.Ip)" } else { "เลือกเครือข่ายที่จะใช้ IP $($c.Ip)" })
+      $why = $(if (Test-AutoInRange $c $nets) { "เจอ $prefix แต่เครื่องนี้ยังไม่เคยเข้าสู่ระบบ กดเชื่อมต่อแล้วใส่ชื่อผู้ใช้และรหัสผ่านในรายการ Wi-Fi ของ Windows" }
+        elseif ($prefix) { "ไม่เจอ Wi-Fi ที่ชื่อขึ้นต้นด้วย $prefix ที่เคยใช้ เลือกเครือข่ายที่จะใช้ IP $($c.Ip)" } else { "เลือกเครือข่ายที่จะใช้ IP $($c.Ip)" })
       $pick = Show-WifiChooser $c $why
       if (-not $pick) {
         if ($radioWasOff) { [void](Set-WifiRadio $false) }
         Set-Log '#FF8A8A8A' 'ยังไม่ได้เลือก Wi-Fi จึงไม่ได้เปลี่ยนอะไร'
         return
       }
+      $plan.To = $pick.Ssid
       $wait = "`n" + (Use-WifiChoice $pick)
       if ($pick.Saved) { $chooserAt = [DateTime]::Now.AddSeconds(20) }
     }
     $wait += "`nไม่ติดภายใน 3 นาทีจะกลับเป็นแบบเดิม (กด ยกเลิก ได้)"
   }
   $file = [IO.Path]::GetTempFileName()
+  if ($plan) { Save-WifiPlan $file $plan }
   $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Apply $mode -ResultFile `"$file`"$SelfArgs"
   try {
     if (Test-Admin) { $p = Start-Process powershell.exe -ArgumentList $argList -WindowStyle Hidden -PassThru }
     else { $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -WindowStyle Hidden -PassThru }
   } catch {
-    Remove-Item $file -ErrorAction SilentlyContinue
+    Remove-Item $file, "$file.wifi" -ErrorAction SilentlyContinue
+    if ($from) { Connect-Wifi $from }
     if ($radioWasOff) { [void](Set-WifiRadio $false) }
     Set-Log '#FFC42B1C' 'ไม่ได้รับสิทธิ์ admin จึงยังไม่ได้เปลี่ยนอะไร'; return
   }
@@ -1110,7 +1225,7 @@ function Start-Switch([string]$mode) {
   $text = "กำลังเปลี่ยนเป็น $($ModeLabel[$mode]) ...$wait"
   Set-Log '#FF0067C0' $text -Busy
   $script:job = @{ Proc = $p; File = $file; Start = [DateTime]::Now; Text = $text; Shown = -1; ChooserAt = $chooserAt; WifiIndex = $wifiIndex; RadioWasOff = $radioWasOff
-                   Mode = $mode; Prev = $prev; CancelAsked = $false }
+                   Mode = $mode; Prev = $prev; CancelAsked = $false; Plan = $plan; WifiDone = $false }
   $timer.Start()
 }
 
